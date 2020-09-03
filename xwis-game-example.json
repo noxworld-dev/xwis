@@ -1,0 +1,9 @@
+{
+	"name": "My Server",
+	"map": "mymap",
+	"map_type": "arena",
+	"access": "open",
+	"resolution": "640x480",
+	"max_players": 31,
+	"frag_limit": 15
+}
