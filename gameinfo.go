@@ -284,6 +284,7 @@ func (m *MapType) UnmarshalJSON(data []byte) error {
 }
 
 type GameInfo struct {
+	Addr       string        `json:"addr"`
 	Name       string        `json:"name"`
 	Map        string        `json:"map"`
 	MapType    MapType       `json:"map_type"`

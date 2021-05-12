@@ -288,6 +288,13 @@ func (c *Client) ListRooms(ctx context.Context) ([]Room, error) {
 			info, err := decryptAndDecode([]byte(payload))
 			if err != nil {
 				log.Printf("cannot parse game info: %v", err)
+			} else {
+				if v, err := strconv.ParseUint(m.Params[7], 10, 32); err != nil {
+					log.Printf("cannot parse game addr: %v", err)
+				} else {
+					ip := net.IPv4(byte(v>>24), byte(v>>16), byte(v>>8), byte(v>>0))
+					info.Addr = ip.String()
+				}
 			}
 			r := Room{
 				ID:   id,

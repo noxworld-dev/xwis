@@ -49,7 +49,11 @@ func TestList(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEmpty(t, list)
 	for _, r := range list {
-		t.Logf("%q", r.Name)
+		if r.Game != nil {
+			t.Logf("%q - %s", r.Name, r.Game.Addr)
+		} else {
+			t.Logf("%q", r.Name)
+		}
 	}
 }
 
