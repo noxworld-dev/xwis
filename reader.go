@@ -4,11 +4,14 @@ import (
 	"bufio"
 	"context"
 	"fmt"
-	"gopkg.in/irc.v3"
 	"io"
 	"log"
 	"strings"
+
+	"gopkg.in/irc.v3"
 )
+
+var DebugLog *log.Logger
 
 type reader struct {
 	sc *bufio.Scanner
@@ -56,6 +59,8 @@ func (r *reader) WaitFor(ctx context.Context, cmds ...string) (*irc.Message, err
 				return m, nil
 			}
 		}
-		log.Println(m)
+		if DebugLog != nil {
+			DebugLog.Println(m)
+		}
 	}
 }

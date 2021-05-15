@@ -366,30 +366,36 @@ func (c *Client) HostGame(ctx context.Context, info GameInfo) error {
 	if err := c.w.Flush(); err != nil {
 		return err
 	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	done := ctx.Done()
-	for {
-		select {
-		case <-done:
-			if err := c.w.WriteLinef("PART %s", channel); err != nil {
-				return err
+	errc := make(chan error, 1)
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			default:
 			}
-			if err := c.w.Flush(); err != nil {
-				return err
+			m, err := c.r.ReadMessage()
+			if err == io.EOF {
+				err = io.ErrUnexpectedEOF
 			}
-			return nil
-		default:
+			if err != nil {
+				errc <- fmt.Errorf(pkg+": %w", err)
+				return
+			}
+			if DebugLog != nil {
+				DebugLog.Println(m)
+			}
 		}
-		c.c.SetReadDeadline(time.Now().Add(time.Second))
-		m, err := c.r.ReadMessage()
-		if to, ok := err.(interface{ Timeout() bool }); ok && to.Timeout() {
-			continue
-		}
-		if err == io.EOF {
-			err = io.ErrUnexpectedEOF
-		}
-		if err != nil {
-			return fmt.Errorf(pkg+": %w", err)
-		}
-		log.Println(m)
+	}()
+	select {
+	case err = <-errc:
+	case <-done:
+		err = nil
 	}
+	_ = c.w.WriteLinef("PART %s", channel)
+	_ = c.w.Flush()
+	return err
 }
