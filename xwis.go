@@ -2,6 +2,7 @@ package xwis
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -11,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"gopkg.in/irc.v3"
 )
 
 var (
@@ -21,6 +24,10 @@ var (
 		"Ix",
 		"Dun Mir",
 	}
+)
+
+var (
+	ErrClientClosed = errors.New("client closed")
 )
 
 const (
@@ -143,12 +150,52 @@ func NewClientWithAddress(ctx context.Context, addr, login, pass string) (*Clien
 		w:     newWriter(conn),
 		r:     newReader(conn),
 		login: login,
+		stop:  make(chan struct{}),
 	}
 	if err := c.handshake(ctx, host, pass); err != nil {
 		_ = conn.Close()
 		return nil, err
 	}
+	go c.readLoop()
 	return c, nil
+}
+
+type readStream struct {
+	c    *Client
+	stop chan struct{}
+	msg  chan *irc.Message
+	errc chan error
+}
+
+func (s *readStream) WaitFor(ctx context.Context, cmds ...string) (*irc.Message, error) {
+	done := ctx.Done()
+	for {
+		var m *irc.Message
+		select {
+		case <-s.c.stop:
+			return nil, ErrClientClosed
+		case <-done:
+			return nil, ctx.Err()
+		case err := <-s.errc:
+			return nil, fmt.Errorf(pkg+": wait(%s): %w", strings.Join(cmds, "|"), err)
+		case m = <-s.msg:
+		}
+		for _, c := range cmds {
+			if c == m.Command {
+				return m, nil
+			}
+		}
+	}
+}
+
+func (s *readStream) Close() error {
+	s.c.mu.Lock()
+	defer s.c.mu.Unlock()
+	if s.c.read == s {
+		s.c.read = nil
+	}
+	close(s.stop)
+	return nil
 }
 
 type Client struct {
@@ -156,12 +203,64 @@ type Client struct {
 	mu    sync.Mutex
 	c     net.Conn
 	w     *writer
-	r     *reader
+	r     *reader // owned by readLoop
+	stop  chan struct{}
+	read  *readStream
+}
+
+func (c *Client) curStream() *readStream {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.read
+}
+
+func (c *Client) readLoop() {
+	for {
+		select {
+		case <-c.stop:
+			return
+		default:
+		}
+		m, err := c.r.ReadMessage()
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
+		if err != nil {
+			err = fmt.Errorf(pkg+": %w", err)
+			if DebugLog != nil {
+				DebugLog.Println(err)
+			}
+			if s := c.curStream(); s != nil {
+				select {
+				case <-c.stop:
+				case <-s.stop:
+				case s.errc <- err:
+				}
+			}
+			return
+		}
+		if DebugLog != nil {
+			DebugLog.Println(m)
+		}
+		if s := c.curStream(); s != nil {
+			select {
+			case <-c.stop:
+			case <-s.stop:
+			case s.msg <- m:
+			}
+		}
+	}
 }
 
 func (c *Client) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	select {
+	case <-c.stop:
+		return nil
+	default:
+	}
+	defer close(c.stop)
 	_ = c.c.SetWriteDeadline(time.Now().Add(time.Second))
 	_ = c.w.WriteLine("QUIT")
 	_ = c.w.Flush()
@@ -253,8 +352,38 @@ type Room struct {
 	Game  *GameInfo
 }
 
-func (c *Client) ListRooms(ctx context.Context) ([]Room, error) {
-	c.mu.Lock()
+func (c *Client) newStreamUnsafe() *readStream {
+	c.read = &readStream{
+		c:    c,
+		stop: make(chan struct{}),
+		msg:  make(chan *irc.Message, 5),
+		errc: make(chan error, 1),
+	}
+	return c.read
+}
+
+func (c *Client) lockWhenAvailable(ctx context.Context) error {
+	for {
+		c.mu.Lock()
+		s := c.read
+		if s == nil {
+			return nil // still holding mutex
+		}
+		c.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-c.stop:
+			return ErrClientClosed
+		case <-s.stop:
+		}
+	}
+}
+
+func (c *Client) writeListRoomsReq(ctx context.Context) (*readStream, error) {
+	if err := c.lockWhenAvailable(ctx); err != nil {
+		return nil, err
+	}
 	defer c.mu.Unlock()
 	deadline := getDeadline(ctx)
 	if err := c.c.SetDeadline(deadline); err != nil {
@@ -268,14 +397,28 @@ func (c *Client) ListRooms(ctx context.Context) ([]Room, error) {
 	if err := c.w.Flush(); err != nil {
 		return nil, err
 	}
+	return c.newStreamUnsafe(), nil
+}
+
+// ListRooms lists all available rooms on XWIS.
+func (c *Client) ListRooms(ctx context.Context) ([]Room, error) {
+	read, err := c.writeListRoomsReq(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer read.Close()
 	var out []Room
 	for {
-		m, err := c.r.ReadMessage()
-		if err == io.EOF {
-			err = io.ErrUnexpectedEOF
-		}
-		if err != nil {
-			return nil, fmt.Errorf(pkg+": %w", err)
+		var m *irc.Message
+		select {
+		case <-c.stop:
+			return nil, ErrClientClosed
+		case err := <-read.errc:
+			if err == io.EOF {
+				err = io.ErrUnexpectedEOF
+			}
+			return nil, err
+		case m = <-read.msg:
 		}
 		switch m.Command {
 		case "326": // game
@@ -333,25 +476,28 @@ func (c *Client) ListRooms(ctx context.Context) ([]Room, error) {
 	}
 }
 
-func (c *Client) HostGame(ctx context.Context, info GameInfo) error {
-	info.setDefaults()
-	payload, err := encodeAndEncrypt(&info)
+func (c *Client) writeNewChannelReq(ctx context.Context, info *GameInfo) (string, *readStream, error) {
+	if err := c.lockWhenAvailable(ctx); err != nil {
+		return "", nil, err
+	}
+	defer c.mu.Unlock()
+	channel := fmt.Sprintf("#%s's_game", c.login)
+	if err := c.w.WriteLinef("JOINGAME %s 1 %d 37 3 1 1 13893824", channel, info.MaxPlayers); err != nil {
+		return "", nil, err
+	}
+	if err := c.w.Flush(); err != nil {
+		return "", nil, err
+	}
+	return channel, c.newStreamUnsafe(), nil
+}
+
+func (c *Client) writeStartGameReq(ctx context.Context, channel string, info *GameInfo) error {
+	payload, err := encodeAndEncrypt(info)
 	if err != nil {
 		return err
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
-	channel := fmt.Sprintf("#%s's_game", c.login)
-	if err := c.w.WriteLinef("JOINGAME %s 1 %d 37 3 1 1 13893824", channel, info.MaxPlayers); err != nil {
-		return err
-	}
-	if err := c.w.Flush(); err != nil {
-		return err
-	}
-	if _, err := c.r.WaitFor(ctx, "366"); err != nil {
-		return err
-	}
 	if err := c.w.WriteLinef("TOPIC %s %s", channel, string(payload)); err != nil {
 		return err
 	}
@@ -366,36 +512,91 @@ func (c *Client) HostGame(ctx context.Context, info GameInfo) error {
 	if err := c.w.Flush(); err != nil {
 		return err
 	}
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	done := ctx.Done()
-	errc := make(chan error, 1)
-	go func() {
-		for {
-			select {
-			case <-done:
-				return
-			default:
-			}
-			m, err := c.r.ReadMessage()
-			if err == io.EOF {
-				err = io.ErrUnexpectedEOF
-			}
-			if err != nil {
-				errc <- fmt.Errorf(pkg+": %w", err)
-				return
-			}
-			if DebugLog != nil {
-				DebugLog.Println(m)
-			}
-		}
-	}()
-	select {
-	case err = <-errc:
-	case <-done:
-		err = nil
+	return nil
+}
+
+func (c *Client) writeUpdateGameReq(ctx context.Context, channel string, info *GameInfo) error {
+	payload, err := encodeAndEncrypt(info)
+	if err != nil {
+		return err
 	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.w.WriteLinef("TOPIC %s %s", channel, string(payload)); err != nil {
+		return err
+	}
+	if err := c.w.Flush(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *Client) writeHostGameReq(ctx context.Context, info *GameInfo) (string, error) {
+	channel, read, err := c.writeNewChannelReq(ctx, info)
+	if err != nil {
+		return "", err
+	}
+	if _, err := read.WaitFor(ctx, "366"); err != nil {
+		return "", err
+	}
+	_ = read.Close()
+	if err := c.writeStartGameReq(ctx, channel, info); err != nil {
+		return "", err
+	}
+	return channel, nil
+}
+
+func (c *Client) writeStopGameReq(channel string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	_ = c.w.WriteLinef("PART %s", channel)
-	_ = c.w.Flush()
-	return err
+	return c.w.Flush()
+}
+
+// HostGame registers a game and keeps it online until the context is cancelled.
+// This call blocks for the whole duration of the game.
+func (c *Client) HostGame(ctx context.Context, info GameInfo) error {
+	g, err := c.RegisterGame(ctx, info)
+	if err != nil {
+		return err
+	}
+	defer g.Close()
+	select {
+	case <-c.stop:
+		return ErrClientClosed
+	case <-ctx.Done():
+	}
+	return nil
+}
+
+type Game struct {
+	c       *Client
+	info    GameInfo
+	channel string
+	closed  bool
+}
+
+// Update info for this game.
+func (g *Game) Update(ctx context.Context, info GameInfo) error {
+	info.setDefaults()
+	return g.c.writeUpdateGameReq(ctx, g.channel, &info)
+}
+
+// Close the game and remove it from XWIS.
+func (g *Game) Close() error {
+	if g.closed {
+		return nil
+	}
+	g.closed = true
+	return g.c.writeStopGameReq(g.channel)
+}
+
+// RegisterGame register the game online and allows to control it asynchronously.
+func (c *Client) RegisterGame(ctx context.Context, info GameInfo) (*Game, error) {
+	info.setDefaults()
+	channel, err := c.writeHostGameReq(ctx, &info)
+	if err != nil {
+		return nil, err
+	}
+	return &Game{c: c, info: info, channel: channel}, nil
 }

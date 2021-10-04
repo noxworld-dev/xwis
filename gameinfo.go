@@ -324,6 +324,12 @@ func (g *GameInfo) setDefaults() {
 	if g.Flags == 0 {
 		g.Flags = defaultFlags
 	}
+	if g.MinPing <= 0 {
+		g.MinPing = -1
+	}
+	if g.MaxPing <= 0 {
+		g.MaxPing = -1
+	}
 }
 
 func (g *GameInfo) MarshalBinary() ([]byte, error) {
